@@ -28,9 +28,15 @@
 use strict;
 use warnings;
 use vars qw(%RAD_REQUEST %RAD_REPLY %RAD_CHECK);
-use AnyEvent::Yubico;
-use Crypt::CBC;
 use Error qw(:try);
+
+# for verifying OTPs via ykval
+use HTTP::Tiny;
+use MIME::Base64;
+use Digest::HMAC_SHA1 qw(hmac_sha1);
+use URI::Escape;
+use Crypt::OpenSSL::Random qw(random_bytes random_status);
+
 
 #Add script directory to @INC:
 use File::Spec::Functions qw(rel2abs);
@@ -59,19 +65,6 @@ do "/etc/yubico/rlm/ykrlm-config.cfg";
 # Initialization
 my $otp_len = 32 + $id_len;
 
-my $key = Crypt::CBC->random_bytes(128);
-my $cipher = Crypt::CBC->new(
-	-key => $key,
-	-cipher => 'Blowfish',
-	-padding => 'space',
-	-add_header => 1
-);
-my $ykval = AnyEvent::Yubico->new({
-	client_id => $client_id,
-	api_key => $api_key,
-	urls => $verify_urls
-});
-
 use YKmap;
 if(defined $mapping_file) {
 	YKmap::set_file($mapping_file);
@@ -95,6 +88,7 @@ use constant	RLM_MODULE_NUMCODES=>  9;#  /* How many return codes there are */
 
 # Make sure the user has a valid YubiKey OTP
 sub authorize {
+
 	# Extract OTP, if available
 	my $otp = '';
 	if($RAD_REQUEST{'User-Name'} =~ /[cbdefghijklnrtuv]{$otp_len}$/) {
@@ -105,18 +99,6 @@ sub authorize {
 		my $password_len = length($RAD_REQUEST{'User-Password'}) - $otp_len;
 		$otp = substr $RAD_REQUEST{'User-Password'}, $password_len;
 		$RAD_REQUEST{'User-Password'} = substr $RAD_REQUEST{'User-Password'}, 0, $password_len;
-	}
-
-	# Check for State, in the case of a previous Access-Challenge.
-	if(! $RAD_REQUEST{'State'} eq '') {
-		#Restore password from State
-		my $state = pack('H*', substr($RAD_REQUEST{'State'}, 2));
-		try {
-			my $password = decrypt_password($state);
-			$RAD_REQUEST{'User-Password'} = $password;
-		} catch Error with {
-			#State not for us, ignore.
-		}
 	}
 
 	my $username = $RAD_REQUEST{'User-Name'};
@@ -130,10 +112,8 @@ sub authorize {
 			$RAD_REPLY{'Reply-Message'} = "Missing username and OTP!";
 			return RLM_MODULE_REJECT;
 		} elsif($security_level eq 2 or ($security_level eq 1 and YKmap::has_otp($username))) {
-			$RAD_REPLY{'State'} = encrypt_password($RAD_REQUEST{'User-Password'});
 			$RAD_REPLY{'Reply-Message'} = "Please provide YubiKey OTP";
-			$RAD_CHECK{'Response-Packet-Type'} = "Access-Challenge";
-			return RLM_MODULE_HANDLED;
+			return RLM_MODULE_REJECT;
 		} else {
 			# Allow login without OTP
 			&radiusd::radlog(1, "$username allowed with no OTP");
@@ -141,6 +121,7 @@ sub authorize {
 		}
 	} elsif(validate_otp($otp)) {
 		&radiusd::radlog(1, "OTP is valid: $otp");
+
 		my $public_id = substr($otp, 0, $id_len);
 
 		#Lookup username if needed/allowed.
@@ -152,19 +133,21 @@ sub authorize {
 
 		if(YKmap::key_belongs_to($public_id, $username)) {
 			&radiusd::radlog(1, "$username has valid OTP: $otp");
+			&radiusd::radlog(2, "Accepted OTP for $username from " . $RAD_REQUEST{'NAS-IP-Address'});
 			return RLM_MODULE_OK;
 		} elsif($allow_auto_provisioning and YKmap::can_provision($public_id, $username)) {
 			&radiusd::radlog(1, "Attempt to provision $public_id for $username post authentication");
 			$RAD_CHECK{'YubiKey-Provision'} = $public_id;
 			return RLM_MODULE_UPDATED;	
 		} else {
-			&radiusd::radlog(1, "Reject: $username using valid OTP from foreign YubiKey: $public_id");
+			&radiusd::radlog(2, "Rejected valid OTP from foreign YubiKey $public_id for $username from " . $RAD_REQUEST{'NAS-IP-Address'}); 
 			$RAD_REPLY{'Reply-Message'} = "Invalid OTP!";
 			return RLM_MODULE_REJECT;
 		}
 	} else {
 		#Invalid OTP
 		&radiusd::radlog(1, "Reject: $username with invalid OTP: $otp");
+		&radiusd::radlog(2, "Rejected OTP for $username from " . $RAD_REQUEST{'NAS-IP-Address'});
 		$RAD_REPLY{'Reply-Message'} = "Invalid OTP!";
 		return RLM_MODULE_REJECT;
 	}
@@ -182,15 +165,162 @@ sub post_auth {
 	return RLM_MODULE_OK;
 }
 
+
+sub authenticate {
+	my $username = $RAD_REQUEST{'User-Name'};
+	my $password = $RAD_REQUEST{'User-Password'};
+
+	if(YKmap::verify_password($username, $password)) {
+		&radiusd::radlog(2, "Accepted password for $username from " . $RAD_REQUEST{'NAS-IP-Address'});
+		return RLM_MODULE_OK;
+	}
+
+	&radiusd::radlog(2, "Rejected password for $username from " . $RAD_REQUEST{'NAS-IP-Address'});
+
+	# Same error message to user to reduce oracle attacks
+	$RAD_REPLY{'Reply-Message'} = "Invalid OTP!";
+ 	return RLM_MODULE_REJECT;
+} 
+
+
 ##################
 # OTP Validation #
 ##################
+
+# From AnyEvent::Yubico
+# Parses a response body into a hash.
+sub parse_response {
+        my $body = shift;
+        my $response = {};
+
+        if($body) {
+                my @lines = split(' ', $body);
+                foreach my $line (@lines) {
+                        my $index = index($line, '=');
+                        $response->{substr($line, 0, $index)} = substr($line, $index+1);
+                }
+        }
+
+        return $response;
+}
+
+# From AnyEvent::Yubico
+# Signs a parameter hash using the client API key.
+sub sign {
+        my ($params) = @_;
+        my $content = "";
+
+        foreach my $key (sort keys %$params) {
+                $content = $content."&$key=$params->{$key}";
+        }
+        $content = substr($content, 1);
+
+        my $key = decode_base64($api_key);
+        my $signature = encode_base64(hmac_sha1($content, $key), '');
+
+        return $signature;
+}
+
+# Makes a cryptographically-strong nonce
+# returns a string with 128 bits of entropy
+sub make_nonce() {
+	# bail out here if there's not enough entropy. better than using
+	# non-random data!
+	die("OpenSSL PRNG isn't adequately seeded. Also, do you have /dev/urandom?") if(!random_status());
+
+	# 16 bytes = 128 bits
+	# hex is fine.
+	my $random = random_bytes(16);
+	return sprintf("%s", unpack("H*",$random));
+}
+
+# Fetch a URL.
+# Returns the body if success, undef otherwise
+sub fetch_url($) {
+	my $url = shift;
+
+	# version check if running https.
+	# old versions will silently ignore bad ssl certs.
+	if(HTTP::Tiny->VERSION <= 0.012 && $url =~ /^\s*https/i) {
+		die("Your version of HTTP::Tiny (" . HTTP::Tiny->VERSION . ") probably ignores bad ssl certs and will be vulnerable to a MITM attack.  Upgrade your package or uncomment this check if you accept this risk.");
+	}
+
+	my $response = HTTP::Tiny->new(timeout=>10, verify_ssl=> 1)->get($url);
+
+	return undef unless($response->{success});
+
+	return $response->{content};
+}
 
 # Validates a YubiKey OTP.
 sub validate_otp {
 	my($otp) = @_;
 
-	return $ykval->verify($otp);
+	# we'll use a different implementation to talk http since
+	# AnyEvent::HTTP has nondeterministic behavior with rlm_perl 
+	# and multiple threads.
+
+	# similar logic to AnyEvent::Yubico verify_async
+	# prepare parameters for request
+
+	# AnyEvent::Yubico uses UUID::Tiny for the nonce.
+	# This is NOT cryptographically strong.
+	# We'll use OpenSSL's PRNG instead.
+	my $nonce = make_nonce();
+
+	my $params = {
+		id => $client_id,
+		nonce => $nonce,
+		otp => $otp,
+	};
+
+	# sign request?
+	my $signature = '';
+	if($api_key ne '') {
+		$signature = sign($params);
+		$params->{h} = $signature;
+	}
+
+	# escape query string
+	my $query = '';
+	for my $key (keys %$params) {
+		$query = "$query&$key=".uri_escape($params->{$key});
+	}
+	$query = "?".substr($query, 1);
+
+	# validate the responses. stop on the first host to accept
+	# note: a redundant configuration may cause one or more
+	# validators to return REPLAYED_REQUEST, which is OK as long as
+	# at least ONE validator returns OK.
+	foreach my $url(@$verify_urls) {
+		my $body = fetch_url("$url$query");
+		next unless($body);
+		
+		my $response = parse_response($body);
+
+		# check signature if availible
+		if($api_key ne '') {
+			my $signature = $response->{h};
+			delete $response->{h};
+			if(! $signature eq sign($response)) {
+				$response->{status} = "BAD_RESPONSE_SIGNATURE";
+				# this is something we want to know about.
+				&radiusd::radlog(3, "BAD_RESPONSE_SIGNATURE from $url for NAS " . $RAD_REQUEST{'NAS-IP-Address'});
+			}
+		}
+
+		# A redundant configuration may cause one or more validators 
+		# to return REPLAYED_REQUEST, which is fine as long as
+		# at least ONE validator returns OK.
+		# thus, we can just ignore a REPLAYED_REQUEST response.
+		next if($response->{status} eq "REPLAYED_REQUEST");
+
+		# Here's the one case for success!
+		return 1 if($response->{status} eq "OK" && $nonce eq $response->{nonce} && $otp eq $response->{otp});
+	}
+
+	# if we're still here, that means there's no chance of success.
+	return 0;
 }
 
 
@@ -198,12 +328,15 @@ sub validate_otp {
 sub encrypt_password {
 	my($plaintext) = @_;
 
-	return $cipher->encrypt($plaintext);
+	# Crypt::CBC uses Carp in a way that blows up this module on 
+	# Debian Wheezy.  It's probably OK to just pass the password back
+	# to the client as-is, since it's 
+	return $plaintext;
 }
 
 # Decrypts a password using an instance specific key
 sub decrypt_password {
 	my($ciphertext) = @_;
-
-	return $cipher->decrypt($ciphertext);
+	return $ciphertext;
+	#return $cipher->decrypt($ciphertext);
 }

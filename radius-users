@@ -1,0 +1,338 @@
+#!/usr/bin/perl
+
+# radius-users - manage the ykmapping user database
+#
+# We store usernames, public_ids and passwords in an sqlite DB
+# to minimize input errors with potential for collateral damage
+# and to perform user updates without restarting freeradius.
+#
+# This is the management component for that DB.
+
+
+# use the config for rlm_yubico.pl
+my $config_file = "/etc/yubico/rlm/ykrlm-config.cfg";
+
+# Load user configuration
+#do $config_file;
+
+$mapping_file='dbi:SQLite:dbname=/tmp/ykmapping-temp.sqlite';
+
+# Let's just stop here if the file isn't a DSN.
+die("\$mapping_file in $config_file does not look like an SQLite DSN.  This utility will not work on anything but SQLite databases.") unless($mapping_file =~ /^dbi:SQLite:dbname=/);
+
+
+my $DBDSN = $mapping_file;
+
+
+
+## includes
+
+# get real random numbers that are safe for crypto
+use Crypt::OpenSSL::Random qw(random_bytes random_status);
+
+# database for clients
+use DBI;
+
+# this script will take arguments
+use Getopt::Long;
+
+
+# world-readable files are bad for us.
+umask 0077;
+
+
+## return a cryptographically-strong password with 24 bits of entropy
+# We will use three lower-case letters and three numbers, which should be
+# easy to type.
+# 
+# This password should require 6048000 guesses on the average to hit,
+# or about 10 guesses/second for 1 week.  Pretty reasonable for an online
+# attack.
+#
+# dies if insufficient entropy (usually means no /dev/urandom)
+sub makePassword()
+{
+
+    # bail out here if there's not enough entropy. better than using non-random data.
+    die("OpenSSL PRNG isn't adequately seeded.  Do you have /dev/urnadom?") if( !random_status() );
+
+    my $password = '';
+
+    # three letters
+    while( length $password < 3 )
+    {
+        my $chr = unpack("C", random_bytes(1));
+	# this seems pretty weird compared to using %, though it removes
+	# any bias caused by %
+	next unless( $chr > 96 && $chr < 123 );
+	$password .= sprintf("%c", $chr);
+    }
+
+    # three numbers
+    while( length $password < 6 )
+    {
+        my $chr = unpack("C", random_bytes(1));
+	next unless( $chr > 47 && $chr < 58 );
+	$password .= sprintf("%c", $chr);
+    }
+
+    return $password;
+}
+  
+
+
+## create a crypt() password hash
+sub hashPassword($)
+{
+    my $password = shift;
+
+    # need some salt!
+    my $salt = '';
+    
+    # MD5 uses 8 character salt, [a-zA-Z0-9./]
+    while( length $salt < 8 )
+    {
+        my $chr = unpack("C", random_bytes(1));
+	next unless( ($chr > 45 && $chr < 58) || ($chr > 96 && $chr < 123) || ($chr > 64 && $chr < 91) );
+	$salt .= sprintf("%c", $chr);
+    }
+
+    # munge into crypt() compatible format
+    $salt = "\$1\$$salt\$";
+
+    # do the crypt thing
+    return crypt($password, "\$1\$$salt\$");
+}
+
+
+
+## create database schema
+# provide a usable DSN string.
+# dies if anything goes wrong.
+# DO NOT CALL THIS IF YOU HAVE ALREADY CONNECTED TO THE DATABASE.
+sub createDB($)
+{
+    my $DBDSN = shift;
+
+    # connect
+    my $dbh = DBI->connect($DBDSN, "", "", 
+        { AutoCommit => 1, PrintWarn => 1, PrintError => 1}) or die($!);
+
+    # create table
+    printf STDERR ("Creating database at DSN: %s\n", $DBDSN);
+    $dbh->do("CREATE TABLE radius_users ( username text not null primary key, crypt_password text not null, keys text)") or die($dbh->errstr);
+    
+    # yay!
+    printf STDERR ("Success!\n");
+}
+
+
+
+## print some help
+sub printHelp()
+{
+    printf STDERR ("Usage: %s <action>\n", $0);
+    print STDERR << '__END__HELP__';
+
+Manage the radius user database and YKmapping.
+
+Action:
+  --create             Create and initialize the database.
+
+  --adduser <user>     Add a user and set the user's password.
+                       Resets password of existing user.
+
+  --deluser <user>     Delete a user and disassociate all of their yubikeys.
+
+  --addyubikey <user> <public_id | tap>
+                       Add/associate a yubikey to an existing user. Provide
+		       the public_id or a token tap
+          
+  --delyubikey <user> <public_id | tap>
+                       Delete/disassociate a yubikey from an existing user.	
+		       Provide the public_id or a token tap
+
+  --whohas <public_id | tap>
+                       Display the username(s) associated with a yubikey.
+
+  --listusers          Dump a list of users and their keys.
+
+  --help               This message
+__END__HELP__
+
+    exit(1);
+}
+
+
+## option handler - figure out what action to perform
+our $action = undef;
+sub optionHandler($$)
+{
+    my($opt_name, $opt_value) = @_;
+
+    # if we're trying to set an action again, this is an error. show some
+    # help, as the user has NFI what they're doing.
+    if( defined($action)  || lc($action) eq 'help' )
+    {
+        warn("Multiple actions specified.  Use one.");
+        printHelp();
+	exit(1);
+    }
+
+    $action = $opt_name;
+
+}
+
+## do stuff
+
+# determine action to perform
+GetOptions(
+    'createdb' => \&optionHandler,
+    'adduser' => \&optionHandler,
+    'deluser' => \&optionHandler,
+    'listusers' => \&optionHandler,
+    'addyubikey' => \&optionHandler,
+    'delyubikey' => \&optionHandler,
+    'whohas'  => \&optionHandler,
+    'help' => \&optionHandler );
+
+# no action.  eeh?
+if( !defined($action) )
+{
+    printHelp();
+    exit(1);
+}
+
+
+# action: create the database 
+if( $action eq 'createdb' )
+{
+    createDB($DBDSN);
+    exit(0);
+}
+
+
+# everything below will touch the db. this is a good time to
+# connect.
+my $dbh = DBI->connect($DBDSN, "", "", { AutoCommit => 0, PrintWarn => 0, PrintError => 0, RaiseError => 0} ) or die($dbh->errstr);
+
+# hold a database row.
+my @row;
+
+# check for schema -- this might be a fresh or wrong file.
+# just need to know if there's a radius_users table.
+# this might throw an error. let's assume it means 'table doesnt exist'
+my $sth = $dbh->prepare("select username from radius_users limit 1");
+if( !defined $sth )
+{
+    die("Database seems to be missing or uninitalized. Try creating it.\n" . 
+    "  Hint: $0 --create\n");
+}
+else
+{
+    $sth->finish();
+}
+
+
+# action: add a user
+if( $action eq 'adduser' )
+{
+    # we should have a username on the args array.
+    my $username  = $ARGV[0];
+    die("This action requires a username\n") unless($username);
+
+    # trim whitespace. it happens.
+    $username =~ s/^\s*//g;
+    $username =~ s/\s*$//g;
+    die("This action requires a username\n") unless(length $username);
+
+    # generate a new password for the user
+    my $password = makePassword();
+    my $crypt = hashPassword($password);
+
+    # we're going to do two things: add user and generate their pw
+    # this needs to be atomic.
+    $dbh->begin_work();
+
+    # get the user's keys, if any.
+    my $keys = '';
+    $sth = $dbh->prepare("SELECT keys from radius_users where username = ?") or die($dbh->errstr);
+    $sth->execute($username) or die($dbh->errstr);
+    @row = $sth->fetchrow_array();
+    $keys = $row[0] if(scalar @row);
+    $sth->finish();
+
+    # add the user. this should be a no-op if the user already exists
+    $sth = $dbh->prepare("INSERT OR REPLACE INTO radius_users (username, crypt_password, keys) values(?,?,?)") or die($dbh->errstr);
+    $sth->execute($username, $crypt, $keys) or die($dbh->errstr);
+    $sth->finish();
+
+    $dbh->commit();
+
+    printf("Added/Reset user: %s\nPassword: %s\n", $username, $password);
+
+    exit(0);
+}
+
+
+# action del a user
+if( $action eq 'deluser' )
+{
+    # we should have a username on the args array.
+    my $username  = $ARGV[0];
+    die("This action requires a username\n") unless($username);
+
+    # trim whitespace. it happens.
+    $username =~ s/^\s*//g;
+    $username =~ s/\s*$//g;
+    die("This action requires a username\n") unless(length $username);
+
+    # expunge from db!
+    $dbh->begin_work();
+    $sth = $dbh->prepare("DELETE from radius_users where username = ?") or die($dbh->errstr);
+    my $rv = $sth->execute($username) or die($dbh->errstr);
+
+    # good?
+    if( $rv == 1 )
+    {
+        $dbh->commit();
+        printf("Deleted user: %s\n", $username);
+	exit(0);
+    }
+
+    elsif( $rv > 1 )
+    {
+        $dbh->rollback();
+	printf("Deleted too many users (%d) expecting 0 or 1\n", $rv);
+	exit(1);
+    }
+
+    $dbh->rollback();
+    printf("User not found: %s\n", $username);
+
+    # well, the user doesn't exist in the db anymore, so that's success, right?
+    exit(0);
+}
+
+
+# action: listusers
+if( $action eq 'listusers' )
+{
+
+    # just dump the db!
+    $sth = $dbh->prepare("SELECT username,keys from radius_users order by username asc") or die($dbh->errstr);
+    $sth->execute() or die($dbh->errstr);
+
+    # leading space is intentional. easily filtered with grep -v
+    printf("%-16s\t%s\n ", " Username", "Keys");
+    print "-" x 79;
+
+    while( @row = $sth->fetchrow_array() )
+    {
+        printf("%-16s\t%s\n", $row[0], $row[1]);
+    }
+
+    $sth->finish();
+    $dbh->rollback();  # to squelch warning about implicit rollback
+    exit(0);
+}

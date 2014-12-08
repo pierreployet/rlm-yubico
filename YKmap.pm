@@ -108,9 +108,9 @@ sub _suggest_usernames_sqlite($) {
 	# this might die(). we don't want that, so fail-safe instead.
 	eval {
 		my $dbh = DBI->connect($file, "", "", { AutoCommit => 1, PrintWarn => 0, PrintError => 0}) or die($!);
-		my $sth = $dbh->prepare("SELECT username, crypt_password, keys from radius_users where key like ? order by username") or die($dbh->errstr);
+		my $sth = $dbh->prepare("SELECT username, crypt_password, keys from radius_users where keys like ? order by username") or die($dbh->errstr);
 		$sth->execute("%$key%") or die($dbh->errstr);
-		
+	
 		while(my @row = $sth->fetchrow_array()) {
 			my @keys = split(/,/, $row[2]);
 			unshift(@keys, $row[1]);
@@ -124,7 +124,7 @@ sub _suggest_usernames_sqlite($) {
 	# if something goes wrong, return 'not found'
 	# that's probably the least likely to cause trouble
 	if($@) {
-		warn("Unknown key/public id: $key");
+		warn("Unknown key/public id: $key (Detail: $@)");
 		return {};
 	}
 	return $data;

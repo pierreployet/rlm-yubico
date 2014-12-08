@@ -9,13 +9,19 @@
 # This is the management component for that DB.
 
 
+# take a guess at our script location
+my $BASE = `echo "pushd \$(dirname $0) &>/dev/null && pwd && popd &>/dev/null" | /bin/bash`;
+chomp $BASE;
+
 # use the config for rlm_yubico.pl
-my $config_file = "/etc/yubico/rlm/ykrlm-config.cfg";
+# Where's rlm_yubico.pl?
+my $rlm_yubico_dir = "$BASE";
 
 # Load user configuration
-#do $config_file;
-
-$mapping_file='dbi:SQLite:dbname=/tmp/ykmapping-temp.sqlite';
+# just eval rlm_yubico.pl, since we'll be using stuff from it
+# it'll suck in the appropriate config. how convenient!
+do "$rlm_yubico_dir/rlm_yubico.pl";
+die($@) if($@);
 
 # Let's just stop here if the file isn't a DSN.
 die("\$mapping_file in $config_file does not look like an SQLite DSN.  This utility will not work on anything but SQLite databases.") unless($mapping_file =~ /^dbi:SQLite:dbname=/);
@@ -101,7 +107,7 @@ sub hashPassword($)
     $salt = "\$1\$$salt\$";
 
     # do the crypt thing
-    return crypt($password, "\$1\$$salt\$");
+    return crypt($password, "$salt");
 }
 
 
@@ -139,14 +145,17 @@ Manage the radius user database and YKmapping.
 Action:
   --create             Create and initialize the database.
 
-  --adduser <user>     Add a user and set the user's password.
-                       Resets password of existing user.
+  --adduser <user> [<otp>]    
+                       Add a user and set the user's password.  Associate
+		       the yubikey that generated otp, if provided.
 
   --deluser <user>     Delete a user and disassociate all of their yubikeys.
 
-  --addyubikey <user> <public_id | tap>
+  --resetuser <user>   Reset a user's password.
+
+  --addyubikey <user> <otp>
                        Add/associate a yubikey to an existing user. Provide
-		       the public_id or a token tap
+		       a valid otp.
           
   --delyubikey <user> <public_id | tap>
                        Delete/disassociate a yubikey from an existing user.	
@@ -190,6 +199,7 @@ GetOptions(
     'createdb' => \&optionHandler,
     'adduser' => \&optionHandler,
     'deluser' => \&optionHandler,
+    'resetuser' => \&optionHandler,
     'listusers' => \&optionHandler,
     'addyubikey' => \&optionHandler,
     'delyubikey' => \&optionHandler,
@@ -241,35 +251,63 @@ if( $action eq 'adduser' )
     my $username  = $ARGV[0];
     die("This action requires a username\n") unless($username);
 
+    # we might have an otp on the args array.
+    my $otp = '';
+    $otp = $ARGV[1] if( defined($ARGV[1]) );
+
     # trim whitespace. it happens.
     $username =~ s/^\s*//g;
     $username =~ s/\s*$//g;
     die("This action requires a username\n") unless(length $username);
 
+    $otp =~ s/^\s*//g;
+    $otp =~ s/\s*$//g;
+
+    # check OTP here. convert to public_id
+    if( length $otp )
+    {
+        die("Invalid OTP provided: $otp\n") unless(validate_otp($otp));
+	$otp = substr($otp, 0, $id_len);
+    }
+
+    # we're going to do three things:
+    # check if otp is in use, check if user exists and add user
+    # this needs to be atomic.
+    $dbh->begin_work();
+
+    # check if the user exists. this is a good place to stop if it does.
+    $sth = $dbh->prepare("SELECT username from radius_users where username = ?") or die($dbh->errstr);
+    $sth->execute($username) or die($dbh->errstr);
+    @row = $sth->fetchrow_array();
+    if( scalar @row )
+    {
+        $dbh->rollback();
+        die("Refusing to add existing user: $username\n");
+    }
+
+    # check if the public_id / otp isn't used by another user
+    if( length $otp )
+    {
+        my $existing = YKmap::lookup_username($otp);
+	if( $existing )
+	{
+            $dbh->rollback();
+	    die("OTP/public_id assigned to existing user: $existing\n")
+	}
+    }
+
     # generate a new password for the user
     my $password = makePassword();
     my $crypt = hashPassword($password);
 
-    # we're going to do two things: add user and generate their pw
-    # this needs to be atomic.
-    $dbh->begin_work();
-
-    # get the user's keys, if any.
-    my $keys = '';
-    $sth = $dbh->prepare("SELECT keys from radius_users where username = ?") or die($dbh->errstr);
-    $sth->execute($username) or die($dbh->errstr);
-    @row = $sth->fetchrow_array();
-    $keys = $row[0] if(scalar @row);
-    $sth->finish();
-
-    # add the user. this should be a no-op if the user already exists
-    $sth = $dbh->prepare("INSERT OR REPLACE INTO radius_users (username, crypt_password, keys) values(?,?,?)") or die($dbh->errstr);
-    $sth->execute($username, $crypt, $keys) or die($dbh->errstr);
+    # add the user. 
+    $sth = $dbh->prepare("INSERT INTO radius_users (username, crypt_password, keys) values(?,?,?)") or die($dbh->errstr);
+    $sth->execute($username, $crypt, $otp) or die($dbh->errstr);
     $sth->finish();
 
     $dbh->commit();
 
-    printf("Added/Reset user: %s\nPassword: %s\n", $username, $password);
+    printf("Added user: %s\nPassword: %s\n", $username, $password);
 
     exit(0);
 }
@@ -315,6 +353,49 @@ if( $action eq 'deluser' )
 }
 
 
+# action: reset a user's password
+if( $action eq 'resetuser' )
+{
+    # we should have a username on the args array.
+    my $username  = $ARGV[0];
+    die("This action requires a username\n") unless($username);
+
+    # trim whitespace. it happens.
+    $username =~ s/^\s*//g;
+    $username =~ s/\s*$//g;
+    die("This action requires a username\n") unless(length $username);
+
+    # we're going to do two things: check if user exists and update their pw
+    # this needs to be atomic.
+    $dbh->begin_work();
+
+    # check if the user exists. this is a good place to stop if it does not.
+    $sth = $dbh->prepare("SELECT username from radius_users where username = ?") or die($dbh->errstr);
+    $sth->execute($username) or die($dbh->errstr);
+    @row = $sth->fetchrow_array();
+    unless( scalar @row )
+    {
+        $dbh->rollback();
+        die("Refusing to reset password for non-existent user: $username\n");
+    }
+
+    # generate a new password for the user
+    my $password = makePassword();
+    my $crypt = hashPassword($password);
+
+    # update their password
+    $sth = $dbh->prepare("UPDATE radius_users set crypt_password = ? where username = ?") or die($dbh->errstr);
+    $sth->execute($crypt, $username) or die($dbh->errstr);
+    $sth->finish();
+
+    $dbh->commit();
+
+    printf("Reset password for user: %s\nPassword: %s\n", $username, $password);
+
+    exit(0);
+}
+
+
 # action: listusers
 if( $action eq 'listusers' )
 {
@@ -336,3 +417,152 @@ if( $action eq 'listusers' )
     $dbh->rollback();  # to squelch warning about implicit rollback
     exit(0);
 }
+
+
+# action: addyubikey
+if( $action eq 'addyubikey' )
+{
+    # we should have a username on the args array.
+    my $username  = $ARGV[0];
+    die("This action requires a username\n") unless($username);
+
+    # trim whitespace. it happens.
+    $username =~ s/^\s*//g;
+    $username =~ s/\s*$//g;
+    die("This action requires a username\n") unless(length $username);
+
+    # we should also have an otp on the args array.
+    my $otp = $ARGV[1];
+    die("This action requires an OTP\n") unless($otp);
+
+    # might have whitespace. dunno why!
+    $otp =~ s/^\s*//g;
+    $otp =~ s/\s*$//g;
+    die("This action requires an OTP\n") unless(length $otp);
+
+    # validate the OTP. we don't want to add a busted token.
+    die("Invalid OTP provided: $otp\n") unless(validate_otp($otp));
+    $otp = substr($otp, 0, $id_len);
+
+    # make sure this public_id isn't used elsewhere.
+    my $existing = YKmap::lookup_username($otp);
+    die("OTP/public_id assigned to existing user: $existing\n") if( $existing );
+
+    # we're going to do four things:
+    # check if otp is in use, check if user exists
+    # fetch keys for user, update with existing keys + new key
+    # this needs to be atomic.
+    $dbh->begin_work();
+
+    # check if the user exists. this is a good place to stop if it does not.
+    $sth = $dbh->prepare("SELECT username from radius_users where username = ?") or die($dbh->errstr);
+    $sth->execute($username) or die($dbh->errstr);
+    @row = $sth->fetchrow_array();
+    unless( scalar @row )
+    {
+        $dbh->rollback();
+        die("Refusing to add existing user: $username\n");
+    }
+
+    # check if the public_id / otp isn't used by another user
+    if( length $otp )
+    {
+        my $existing = YKmap::lookup_username($otp);
+	if( $existing )
+	{
+            $dbh->rollback();
+	    die("OTP/public_id assigned to existing user: $existing\n")
+	}
+    }
+
+    # get user's keys, if any
+    my $keystr = '';
+    $sth = $dbh->prepare("SELECT keys from radius_users where username = ?") or die($dbh->errstr);
+    $sth->execute($username) or die($dbh->errstr);
+    @row = $sth->fetchrow_array();
+    $keystr = $row[0] if(scalar @row);
+    $sth->finish();
+
+    # convert to array, add another key.
+    my @keys = split(/,/, $keystr);
+    push(@keys, $otp);
+    $keystr = join(',', @keys);
+
+    # and put it back in the db.
+    $sth = $dbh->prepare("UPDATE radius_users set keys = ? where username = ?") or die($dbh->errstr);
+    $sth->execute($keystr, $username) or die($dbh->errstr);
+    $sth->finish();
+
+    $dbh->commit();
+    printf("Added yubikey: %s for user: %s\n", $otp, $username);
+    exit(0);
+}
+
+
+# action: delyubikey
+if( $action eq 'delyubikey' )
+{
+    # we should have a username on the args array.
+    my $username  = $ARGV[0];
+    die("This action requires a username\n") unless($username);
+
+    # trim whitespace. it happens.
+    $username =~ s/^\s*//g;
+    $username =~ s/\s*$//g;
+    die("This action requires a username\n") unless(length $username);
+
+    # we should also have an otp on the args array.
+    my $otp = $ARGV[1];
+    die("This action requires an OTP\n") unless($otp);
+
+    # might have whitespace. dunno why!
+    $otp =~ s/^\s*//g;
+    $otp =~ s/\s*$//g;
+    die("This action requires an OTP\n") unless(length $otp);
+
+    # OTP or just a public id, we don't care.
+    # we might want to delete an OTP that won't validate for whatever reason.
+    $otp = substr($otp, 0, $id_len);
+
+    # we're going to do two things that must be done atomically:
+    # fetch user's keys
+    # update user's keys
+    $dbh->begin_work();
+
+    # We're not going to bother checking if the user actually has
+    # the otp associated with them. If they don't, the operation is arguably
+    # successful since the desired outcome is achieved.
+
+    # get user's keys, if any
+    my $keystr = '';
+    $sth = $dbh->prepare("SELECT keys from radius_users where username = ?") or die($dbh->errstr);
+    $sth->execute($username) or die($dbh->errstr);
+    @row = $sth->fetchrow_array();
+    $keystr = $row[0] if(scalar @row);
+    $sth->finish();
+
+    # convert to array, remove key if present
+    my @keys = split(/,/, $keystr);
+    my $keycount = scalar @keys;
+    @keys = grep { $_ ne $otp } @keys;
+    $keystr = join(',', @keys);
+
+    # stop here if no work done to avoid extraneous db updates
+    if( $keycount == scalar @keys )
+    {
+       $dbh->rollback();
+       printf("Yubikey: %s not associated with user %s\n", $otp, $username);
+       exit(0);
+    }
+
+    # and put it back in the db.
+    $sth = $dbh->prepare("UPDATE radius_users set keys = ? where username = ?") or die($dbh->errstr);
+    $sth->execute($keystr, $username) or die($dbh->errstr);
+    $sth->finish();
+
+    $dbh->commit();
+    printf("Removed yubikey: %s for user: %s\n", $otp, $username);
+    exit(0);
+}
+
+

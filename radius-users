@@ -157,16 +157,18 @@ Action:
                        Add/associate a yubikey to an existing user. Provide
 		       a valid otp.
           
-  --delyubikey <user> <public_id | tap>
+  --delyubikey <user> <public_id | otp>
                        Delete/disassociate a yubikey from an existing user.	
-		       Provide the public_id or a token tap
+		       Provide the public_id or an otp.
 
-  --whohas <public_id | tap>
+  --whohas <public_id | otp>
                        Display the username(s) associated with a yubikey.
+		       Provide the public_id or an otp.
 
   --listusers          Dump a list of users and their keys.
 
   --help               This message
+
 __END__HELP__
 
     exit(1);
@@ -415,6 +417,34 @@ if( $action eq 'listusers' )
 
     $sth->finish();
     $dbh->rollback();  # to squelch warning about implicit rollback
+    exit(0);
+}
+
+
+# action: whohas
+if( $action eq 'whohas' )
+{
+    # we should have an otp on the args array.
+    my $otp = $ARGV[0];
+    die("This action requires an OTP\n") unless($otp);
+
+    # might have whitespace. dunno why!
+    $otp =~ s/^\s*//g;
+    $otp =~ s/\s*$//g;
+    die("This action requires an OTP\n") unless(length $otp);
+
+    # OTP or just a public id, we don't care.
+    $otp = substr($otp, 0, $id_len);
+
+    # see what YKmap thinks, because this is the code that gets used by rlm
+    my $existing = YKmap::lookup_username($otp);
+
+    unless( $existing )
+    {
+        die("OTP not registered: $otp\n");
+    }
+
+    printf("%s\n", $existing);
     exit(0);
 }
 

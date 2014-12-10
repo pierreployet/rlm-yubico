@@ -49,7 +49,9 @@ version to match your Perl installation):
 Set $mapping_file in ykrlm-config.cfg to an SQLite DSN and use the included
 radius-users script to manage the username -> Yubikey mappings.
 Example: 
+
   $mapping_file = "dbi:SQLite:dbname=/etc/yubico/rlm/ykmapping.sqlite";
+
 
 Changes to the SQLite database do not require a restart of FreeRADIUS, though
 the configuration change to enable SQLite support does.
@@ -65,39 +67,53 @@ set correctly before using radius-users.
 Example usage:
 
 Create the initial database:
+
   $ radius-users --create
   Creating database at DSN: dbi:SQLite:dbname=/tmp/ykmapping-temp.sqlite
   Success!
 
+
 Add a user (will add yubikey later):
+
   $ radius-users --adduser testuser
   Added user: testuser
   Password: pat336
 
 Add/associate a yubikey with an existing user:
+
   $ radius-users --addyubikey testuser ccccccccccccklvgijtgthnhfvvurjnilnbdflffuhke
   Added yubikey: cccccccccccc for user: testuser
 
+
 Add a user and associate a yubikey with that user in one step:
+
   $ radius-users --adduser testuser ccccccccccccriljtrcrgnfugjhgcigvdlgingfdriur
   Added user: testuser
   Password: eom669
 
+
 List users:
+
   $ radius-users --listusers
     Username       	Keys
    -------------------------------------------------------------------
    testuser        	cccccccccccc
 
+
 Disassociate a yubikey from a user (public_id or otp):
+
   $ radius-users --delyubikey testuser cccccccccccc
   Removed yubikey: cccccccccccc for user: testuser
 
+
 See who owns a yubikey (public_id or otp):
+
   $ radius-users --whohas ccccccccccccerdtjbjguecbkeeudjchrhnlgrghketl
   testuser
 
+
 Delete a user and associations:
+
   $ radius-users --deluser testuser
   Deleted user: testuser
 
@@ -110,11 +126,17 @@ Notes:
 
   - To require this password + OTP auth (making two-factor):
     1. Set in the users file: 
+
       DEFAULT Auth-Type = Perl
+
+
     2. Set in the radius config inside the authenticate {} block:
+
       Auth-Type Perl {
          perl
       }
+
+
     3. Remove references to PAP from the authenticate {} and
       authorize {} blocks. (Don't worry, FreeRADIUS will still talk PAP, just
       without the PAP module overriding rlm_yubico.pl's decisions.)
@@ -130,15 +152,16 @@ Notes:
 === Dependencies
 
 rlm_yubico requires the following Perl modules:
-Digest::
-Error::
-DBI::
-DBD::SQLite
-Crypt::OpenSSL::Random
-Digest::HMAC_SHA1
-Getopt::Long;
-HTTP::Tiny;
-MIME::Base64;
-URI::Escape;
+
+  Digest::
+  Error::
+  DBI::
+  DBD::SQLite
+  Crypt::OpenSSL::Random
+  Digest::HMAC_SHA1
+  Getopt::Long;
+  HTTP::Tiny;
+  MIME::Base64;
+  URI::Escape;
 
 FreeRADIUS is also required.

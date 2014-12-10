@@ -153,15 +153,17 @@ Notes:
 
 rlm_yubico requires the following Perl modules:
 
-  Digest::
-  Error::
-  DBI::
-  DBD::SQLite
-  Crypt::OpenSSL::Random
-  Digest::HMAC_SHA1
-  Getopt::Long;
-  HTTP::Tiny;
-  MIME::Base64;
-  URI::Escape;
+----
+Digest::
+Error::
+DBI::
+DBD::SQLite
+Crypt::OpenSSL::Random
+Digest::HMAC_SHA1
+Getopt::Long
+HTTP::Tiny
+MIME::Base64
+URI::Escape
+----
 
 FreeRADIUS is also required.

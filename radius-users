@@ -187,7 +187,7 @@ sub optionHandler($$)
 
     # if we're trying to set an action again, this is an error. show some
     # help, as the user has NFI what they're doing.
-    if( defined($action) || (defined($action) && lc($action) eq 'help') )
+    if( defined($action) || $opt_name eq 'help' )
     {
         warn("Multiple actions specified.  Use one.");
         printHelp();
@@ -417,6 +417,7 @@ if( $action eq 'listusers' )
     # leading space is intentional. easily filtered with grep -v
     printf("%-16s\t%s\n ", " Username", "Keys");
     print "-" x 79;
+    print "\n";
 
     while( @row = $sth->fetchrow_array() )
     {

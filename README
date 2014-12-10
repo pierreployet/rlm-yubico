@@ -28,6 +28,7 @@ to query the user for an OTP if one is required but not provided.
 
 Place configuration in /etc/yubico/rlm/ykrlm-config.cfg
 Place username -> YubiKey mappings in /etc/yubico/rlm/ykmapping
+or see below for using SQLite to manage mappings.
 
 See the included ykrlm-config.cfg file for a description of available 
 settings.
@@ -44,13 +45,100 @@ version to match your Perl installation):
 
   LD_PRELOAD=/usr/lib/libperl.so.5.10 freeradius
 
+=== SQLite Mappings
+Set $mapping_file in ykrlm-config.cfg to an SQLite DSN and use the included
+radius-users script to manage the username -> Yubikey mappings.
+Example: 
+  $mapping_file = "dbi:SQLite:dbname=/etc/yubico/rlm/ykmapping.sqlite";
+
+Changes to the SQLite database do not require a restart of FreeRADIUS, though
+the configuration change to enable SQLite support does.
+
+When configured as described below in the notes section, maintaining the
+contents of the users file may no longer be necessary, as rlm_yubico.pl will
+handle looking up users and their passwords in SQLite.
+
+The radius-users script draws upon the rlm_yubico.pl configuration, so there's
+only one place to worry about the mapping_file.  Make sure ykrlm-config.cfg is
+set correctly before using radius-users.
+
+Example usage:
+
+Create the initial database:
+  $ radius-users --create
+  Creating database at DSN: dbi:SQLite:dbname=/tmp/ykmapping-temp.sqlite
+  Success!
+
+Add a user (will add yubikey later):
+  $ radius-users --adduser testuser
+  Added user: testuser
+  Password: pat336
+
+Add/associate a yubikey with an existing user:
+  $ radius-users --addyubikey testuser ccccccccccccklvgijtgthnhfvvurjnilnbdflffuhke
+  Added yubikey: cccccccccccc for user: testuser
+
+Add a user and associate a yubikey with that user in one step:
+  $ radius-users --adduser testuser ccccccccccccriljtrcrgnfugjhgcigvdlgingfdriur
+  Added user: testuser
+  Password: eom669
+
+List users:
+  $ radius-users --listusers
+    Username       	Keys
+   -------------------------------------------------------------------
+   testuser        	cccccccccccc
+
+Disassociate a yubikey from a user (public_id or otp):
+  $ radius-users --delyubikey testuser cccccccccccc
+  Removed yubikey: cccccccccccc for user: testuser
+
+See who owns a yubikey (public_id or otp):
+  $ radius-users --whohas ccccccccccccerdtjbjguecbkeeudjchrhnlgrghketl
+  testuser
+
+Delete a user and associations:
+  $ radius-users --deluser testuser
+  Deleted user: testuser
+
+
+Notes:
+ 
+  - A simple password is generated for every user.  This password is random.
+    This is a good thing.  People suck at making passwords.  This password
+    is inert unless...
+
+  - To require this password + OTP auth (making two-factor):
+    1. Set in the users file: 
+      DEFAULT Auth-Type = Perl
+    2. Set in the radius config inside the authenticate {} block:
+      Auth-Type Perl {
+         perl
+      }
+    3. Remove references to PAP from the authenticate {} and
+      authorize {} blocks. (Don't worry, FreeRADIUS will still talk PAP, just
+      without the PAP module overriding rlm_yubico.pl's decisions.)
+   
+  - If you have performed the above two steps, then your users file only
+    needs the DEFAULT line.  All user management can be handled via 
+    radius-users and rlm_yubico.pl.
+
+  - You can (but should not) set DEFAULT Auth-Type = Accept for
+    OTP-only authentication.  Do so only after understanding the ramifications
+    of doing so.  Hint: they depend on your environment.
+
 === Dependencies
 
 rlm_yubico requires the following Perl modules:
-AnyEvent::Yubico
-Crypt::CBC
 Digest::
 Error::
-Crypt::Blowfish
+DBI::
+DBD::SQLite
+Crypt::OpenSSL::Random
+Digest::HMAC_SHA1
+Getopt::Long;
+HTTP::Tiny;
+MIME::Base64;
+URI::Escape;
 
 FreeRADIUS is also required.

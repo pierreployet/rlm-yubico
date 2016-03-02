@@ -1,4 +1,4 @@
-#!/usr/bin/perl -w
+#!/usr/bin/perl
 
 # radius-users - manage the ykmapping user database
 #
@@ -9,16 +9,12 @@
 # This is the management component for that DB.
 
 
-use strict;
-use File::Basename;
-
-
-# take a guess at our script location
-my $BASE = dirname(__FILE__);
-
 # use the config for rlm_yubico.pl
 # Where's rlm_yubico.pl?
-my $rlm_yubico_dir = "$BASE";
+my $rlm_yubico_dir = "/usr/share/rlm-yubico";
+
+# set this too, since we'll suck in some perl modules
+use lib '/usr/share/rlm-yubico';
 
 # Load user configuration
 # just eval rlm_yubico.pl, since we'll be using stuff from it
@@ -27,10 +23,10 @@ do "$rlm_yubico_dir/rlm_yubico.pl";
 die($@) if($@);
 
 # Let's just stop here if the file isn't a DSN.
-die("\$mapping_file in $main::mapping_file does not look like an SQLite DSN.  This utility will not work on anything but SQLite databases.") unless($main::mapping_file =~ /^dbi:SQLite:dbname=/);
+die("\$mapping_file in $config_file does not look like an SQLite DSN.  This utility will not work on anything but SQLite databases.") unless($mapping_file =~ /^dbi:SQLite:dbname=/);
 
 
-my $DBDSN = $main::mapping_file;
+my $DBDSN = $mapping_file;
 
 
 
@@ -178,7 +174,6 @@ __END__HELP__
 }
 
 
-
 ## option handler - figure out what action to perform
 our $action = undef;
 sub optionHandler($$)
@@ -187,7 +182,7 @@ sub optionHandler($$)
 
     # if we're trying to set an action again, this is an error. show some
     # help, as the user has NFI what they're doing.
-    if( defined($action) || $opt_name eq 'help' )
+    if( defined($action)  || lc($action) eq 'help' )
     {
         warn("Multiple actions specified.  Use one.");
         printHelp();
@@ -198,41 +193,19 @@ sub optionHandler($$)
 
 }
 
-
-
-## returns string from src after trimming whitespace
-# returns undef if dst is an empty string after trimming
-sub copyTrim($)
-{
-    my $src = shift;
-    my $dst = '';
-
-    return undef unless( $src );
-
-    $dst = "$src";
-    $dst =~ s/^\s*//g;
-    $dst =~ s/\s*$//g;
-
-    return undef unless( length "$dst" );
-    return "$dst";
-
-}
-
-
-
 ## do stuff
 
 # determine action to perform
 GetOptions(
-    'createdb'    => \&optionHandler,
-    'adduser'     => \&optionHandler,
-    'deluser'     => \&optionHandler,
-    'resetuser'   => \&optionHandler,
-    'listusers'   => \&optionHandler,
-    'addyubikey'  => \&optionHandler,
-    'delyubikey'  => \&optionHandler,
-    'whohas'      => \&optionHandler,
-    'help'        => \&optionHandler );
+    'createdb' => \&optionHandler,
+    'adduser' => \&optionHandler,
+    'deluser' => \&optionHandler,
+    'resetuser' => \&optionHandler,
+    'listusers' => \&optionHandler,
+    'addyubikey' => \&optionHandler,
+    'delyubikey' => \&optionHandler,
+    'whohas'  => \&optionHandler,
+    'help' => \&optionHandler );
 
 # no action.  eeh?
 if( !defined($action) )
@@ -252,11 +225,10 @@ if( $action eq 'createdb' )
 
 # everything below will touch the db. this is a good time to
 # connect.
-our $dbh = DBI->connect($DBDSN, "", "", { AutoCommit => 0, PrintWarn => 0, PrintError => 0, RaiseError => 0} ) or die($dbh->errstr);
+my $dbh = DBI->connect($DBDSN, "", "", { AutoCommit => 0, PrintWarn => 0, PrintError => 0, RaiseError => 0} ) or die($dbh->errstr);
 
 # hold a database row.
 my @row;
-
 
 # check for schema -- this might be a fresh or wrong file.
 # just need to know if there's a radius_users table.
@@ -277,17 +249,26 @@ else
 if( $action eq 'adduser' )
 {
     # we should have a username on the args array.
-    my $username  = copyTrim($ARGV[0]);
+    my $username  = $ARGV[0];
     die("This action requires a username\n") unless($username);
 
     # we might have an otp on the args array.
-    my $otp = copyTrim($ARGV[1]);
+    my $otp = '';
+    $otp = $ARGV[1] if( defined($ARGV[1]) );
+
+    # trim whitespace. it happens.
+    $username =~ s/^\s*//g;
+    $username =~ s/\s*$//g;
+    die("This action requires a username\n") unless(length $username);
+
+    $otp =~ s/^\s*//g;
+    $otp =~ s/\s*$//g;
 
     # check OTP here. convert to public_id
     if( length $otp )
     {
         die("Invalid OTP provided: $otp\n") unless(validate_otp($otp));
-	$otp = substr($otp, 0, $main::id_len);
+	$otp = substr($otp, 0, $id_len);
     }
 
     # we're going to do three things:
@@ -337,8 +318,13 @@ if( $action eq 'adduser' )
 if( $action eq 'deluser' )
 {
     # we should have a username on the args array.
-    my $username  = copyTrim($ARGV[0]);
+    my $username  = $ARGV[0];
     die("This action requires a username\n") unless($username);
+
+    # trim whitespace. it happens.
+    $username =~ s/^\s*//g;
+    $username =~ s/\s*$//g;
+    die("This action requires a username\n") unless(length $username);
 
     # expunge from db!
     $dbh->begin_work();
@@ -372,8 +358,13 @@ if( $action eq 'deluser' )
 if( $action eq 'resetuser' )
 {
     # we should have a username on the args array.
-    my $username  = copyTrim($ARGV[0]);
+    my $username  = $ARGV[0];
     die("This action requires a username\n") unless($username);
+
+    # trim whitespace. it happens.
+    $username =~ s/^\s*//g;
+    $username =~ s/\s*$//g;
+    die("This action requires a username\n") unless(length $username);
 
     # we're going to do two things: check if user exists and update their pw
     # this needs to be atomic.
@@ -417,7 +408,6 @@ if( $action eq 'listusers' )
     # leading space is intentional. easily filtered with grep -v
     printf("%-16s\t%s\n ", " Username", "Keys");
     print "-" x 79;
-    print "\n";
 
     while( @row = $sth->fetchrow_array() )
     {
@@ -434,11 +424,16 @@ if( $action eq 'listusers' )
 if( $action eq 'whohas' )
 {
     # we should have an otp on the args array.
-    my $otp = copyTrim($ARGV[0]);
+    my $otp = $ARGV[0];
     die("This action requires an OTP\n") unless($otp);
 
+    # might have whitespace. dunno why!
+    $otp =~ s/^\s*//g;
+    $otp =~ s/\s*$//g;
+    die("This action requires an OTP\n") unless(length $otp);
+
     # OTP or just a public id, we don't care.
-    $otp = substr($otp, 0, $main::id_len);
+    $otp = substr($otp, 0, $id_len);
 
     # see what YKmap thinks, because this is the code that gets used by rlm
     my $existing = YKmap::lookup_username($otp);
@@ -457,16 +452,26 @@ if( $action eq 'whohas' )
 if( $action eq 'addyubikey' )
 {
     # we should have a username on the args array.
-    my $username  = copyTrim($ARGV[0]);
+    my $username  = $ARGV[0];
     die("This action requires a username\n") unless($username);
 
+    # trim whitespace. it happens.
+    $username =~ s/^\s*//g;
+    $username =~ s/\s*$//g;
+    die("This action requires a username\n") unless(length $username);
+
     # we should also have an otp on the args array.
-    my $otp = copyTrim($ARGV[1]);
+    my $otp = $ARGV[1];
     die("This action requires an OTP\n") unless($otp);
+
+    # might have whitespace. dunno why!
+    $otp =~ s/^\s*//g;
+    $otp =~ s/\s*$//g;
+    die("This action requires an OTP\n") unless(length $otp);
 
     # validate the OTP. we don't want to add a busted token.
     die("Invalid OTP provided: $otp\n") unless(validate_otp($otp));
-    $otp = substr($otp, 0, $main::id_len);
+    $otp = substr($otp, 0, $id_len);
 
     # make sure this public_id isn't used elsewhere.
     my $existing = YKmap::lookup_username($otp);
@@ -485,7 +490,7 @@ if( $action eq 'addyubikey' )
     unless( scalar @row )
     {
         $dbh->rollback();
-        die("Refusing to add key to nonexistent user: $username\n");
+        die("Refusing to add existing user: $username\n");
     }
 
     # check if the public_id / otp isn't used by another user
@@ -508,8 +513,7 @@ if( $action eq 'addyubikey' )
     $sth->finish();
 
     # convert to array, add another key.
-    my @keys = ();
-    @keys = split(/,/, $keystr) if( $keystr );
+    my @keys = split(/,/, $keystr);
     push(@keys, $otp);
     $keystr = join(',', @keys);
 
@@ -528,16 +532,26 @@ if( $action eq 'addyubikey' )
 if( $action eq 'delyubikey' )
 {
     # we should have a username on the args array.
-    my $username  = copyTrim($ARGV[0]);
+    my $username  = $ARGV[0];
     die("This action requires a username\n") unless($username);
 
+    # trim whitespace. it happens.
+    $username =~ s/^\s*//g;
+    $username =~ s/\s*$//g;
+    die("This action requires a username\n") unless(length $username);
+
     # we should also have an otp on the args array.
-    my $otp = copyTrim($ARGV[1]);
+    my $otp = $ARGV[1];
     die("This action requires an OTP\n") unless($otp);
+
+    # might have whitespace. dunno why!
+    $otp =~ s/^\s*//g;
+    $otp =~ s/\s*$//g;
+    die("This action requires an OTP\n") unless(length $otp);
 
     # OTP or just a public id, we don't care.
     # we might want to delete an OTP that won't validate for whatever reason.
-    $otp = substr($otp, 0, $main::id_len);
+    $otp = substr($otp, 0, $id_len);
 
     # we're going to do two things that must be done atomically:
     # fetch user's keys
@@ -557,8 +571,7 @@ if( $action eq 'delyubikey' )
     $sth->finish();
 
     # convert to array, remove key if present
-    my @keys = (); 
-    @keys = split(/,/, $keystr) if( $keystr );
+    my @keys = split(/,/, $keystr);
     my $keycount = scalar @keys;
     @keys = grep { $_ ne $otp } @keys;
     $keystr = join(',', @keys);
